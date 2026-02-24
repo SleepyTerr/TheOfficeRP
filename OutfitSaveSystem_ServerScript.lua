@@ -1,348 +1,238 @@
 --[[
     ╔══════════════════════════════════════════════════════════╗
-    ║         OUTFIT SAVE SYSTEM — Server Script               ║
-    ║  Place inside: ServerScriptService                       ║
-    ║  (as a regular Script, NOT a LocalScript)                ║
+    ║         OUTFIT SAVE + CATALOG SEARCH — Server Script     ║
+    ║  Place inside: ServerScriptService  (as a Script)        ║
     ╚══════════════════════════════════════════════════════════╝
-
-    This script:
-    - Saves player outfit slots to DataStore (persists between sessions)
-    - Handles RemoteEvents from the client (save, load, list outfits)
-    - Each player gets up to MAX_SLOTS outfit slots (Work, Home, etc.)
 ]]
 
-local DataStoreService = game:GetService("DataStoreService")
-local Players          = game:GetService("Players")
-
--- The DataStore that holds all outfit data
-local OutfitStore = DataStoreService:GetDataStore("PlayerOutfits_v1")
-
--- Max outfit slots per player
-local MAX_SLOTS = 6
-
--- ============================================================
---  REMOTE EVENTS SETUP
---  These let the client (LocalScript) talk to this server script
--- ============================================================
-
+local DataStoreService  = game:GetService("DataStoreService")
+local Players           = game:GetService("Players")
+local HttpService        = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
--- Create a folder to hold our RemoteEvents neatly
+local OutfitStore = DataStoreService:GetDataStore("PlayerOutfits_v1")
+local MAX_SLOTS   = 6
+
+-- ============================================================
+--  REMOTE SETUP
+-- ============================================================
+
 local remoteFolder = Instance.new("Folder")
-remoteFolder.Name = "OutfitRemotes"
+remoteFolder.Name  = "OutfitRemotes"
 remoteFolder.Parent = ReplicatedStorage
 
--- Client → Server: Save current outfit to a slot
-local SaveOutfitEvent = Instance.new("RemoteEvent")
-SaveOutfitEvent.Name = "SaveOutfit"
-SaveOutfitEvent.Parent = remoteFolder
+local function makeEvent(name)
+	local e = Instance.new("RemoteEvent"); e.Name = name; e.Parent = remoteFolder; return e
+end
+local function makeFunc(name)
+	local f = Instance.new("RemoteFunction"); f.Name = name; f.Parent = remoteFolder; return f
+end
 
--- Client → Server (with response): Load an outfit slot
-local LoadOutfitFunc = Instance.new("RemoteFunction")
-LoadOutfitFunc.Name = "LoadOutfit"
-LoadOutfitFunc.Parent = remoteFolder
-
--- Client → Server (with response): Get all saved outfit slots
-local GetOutfitsFunc = Instance.new("RemoteFunction")
-GetOutfitsFunc.Name = "GetOutfits"
-GetOutfitsFunc.Parent = remoteFolder
-
--- Client → Server: Delete an outfit slot
-local DeleteOutfitEvent = Instance.new("RemoteEvent")
-DeleteOutfitEvent.Name = "DeleteOutfit"
-DeleteOutfitEvent.Parent = remoteFolder
-
--- Server → Client: Notify client that save succeeded/failed
-local SaveResultEvent = Instance.new("RemoteEvent")
-SaveResultEvent.Name = "SaveResult"
-SaveResultEvent.Parent = remoteFolder
+local SaveOutfitEvent   = makeEvent("SaveOutfit")
+local DeleteOutfitEvent = makeEvent("DeleteOutfit")
+local SaveResultEvent   = makeEvent("SaveResult")
+local LoadOutfitFunc    = makeFunc("LoadOutfit")
+local GetOutfitsFunc    = makeFunc("GetOutfits")
+local SearchCatalogFunc = makeFunc("SearchCatalog")
+local GetBalanceFunc     = makeFunc("GetBalance")
+local UpdateBalanceEvent = makeEvent("UpdateBalance")
+local GetCharacterModelFunc = makeFunc("GetCharacterModel")
 
 -- ============================================================
---  HELPER: Build a key for the DataStore
+--  DATASTORE HELPERS
 -- ============================================================
 
-local function getKey(userId)
-    return "outfits_" .. tostring(userId)
+local function getKey(userId) return "outfits_" .. tostring(userId) end
+
+local function loadData(userId)
+	local ok, data = pcall(function() return OutfitStore:GetAsync(getKey(userId)) end)
+	return (ok and data) or {}
+end
+
+local function saveData(userId, data)
+	local ok, err = pcall(function() OutfitStore:SetAsync(getKey(userId), data) end)
+	if not ok then warn("DataStore save error: " .. tostring(err)) end
+	return ok
 end
 
 -- ============================================================
---  HELPER: Load player data from DataStore (with retry)
--- ============================================================
-
-local function loadPlayerData(userId)
-    local key = getKey(userId)
-    local success, data = pcall(function()
-        return OutfitStore:GetAsync(key)
-    end)
-    if success then
-        return data or {}  -- Return empty table if no data yet
-    else
-        warn("Failed to load outfit data for " .. userId .. ": " .. tostring(data))
-        return {}
-    end
-end
-
--- ============================================================
---  HELPER: Save player data to DataStore (with retry)
--- ============================================================
-
-local function savePlayerData(userId, data)
-    local key = getKey(userId)
-    local success, err = pcall(function()
-        OutfitStore:SetAsync(key, data)
-    end)
-    if not success then
-        warn("Failed to save outfit data for " .. userId .. ": " .. tostring(err))
-    end
-    return success
-end
-
--- ============================================================
---  HELPER: Snapshot a player's current appearance
---  Returns a table describing all equipped items
+--  OUTFIT CAPTURE
 -- ============================================================
 
 local function captureOutfit(character)
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return nil end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return nil end
 
-    local snapshot = {
-        shirt        = nil,
-        pants        = nil,
-        accessories  = {},
-        description  = nil,
-    }
+	local snapshot = { shirt = nil, pants = nil, accessories = {}, description = nil }
 
-    -- Capture shirt
-    local shirt = character:FindFirstChildOfClass("Shirt")
-    if shirt then
-        snapshot.shirt = shirt.ShirtTemplate
-    end
+	local shirt = character:FindFirstChildOfClass("Shirt")
+	if shirt then snapshot.shirt = shirt.ShirtTemplate end
 
-    -- Capture pants
-    local pants = character:FindFirstChildOfClass("Pants")
-    if pants then
-        snapshot.pants = pants.PantsTemplate
-    end
+	local pants = character:FindFirstChildOfClass("Pants")
+	if pants then snapshot.pants = pants.PantsTemplate end
 
-    -- Capture accessories (hats, hair, etc.)
-    for _, obj in ipairs(character:GetChildren()) do
-        if obj:IsA("Accessory") then
-            local handle = obj:FindFirstChild("Handle")
-            if handle then
-                local mesh = handle:FindFirstChildOfClass("SpecialMesh")
-                if mesh and mesh.MeshId ~= "" then
-                    table.insert(snapshot.accessories, {
-                        name   = obj.Name,
-                        meshId = mesh.MeshId,
-                        texId  = mesh.TextureId,
-                    })
-                end
-            end
-        end
-    end
+	for _, obj in ipairs(character:GetChildren()) do
+		if obj:IsA("Accessory") then
+			local handle = obj:FindFirstChild("Handle")
+			if handle then
+				local mesh = handle:FindFirstChildOfClass("SpecialMesh")
+				if mesh and mesh.MeshId ~= "" then
+					table.insert(snapshot.accessories, {
+						name   = obj.Name,
+						meshId = mesh.MeshId,
+						texId  = mesh.TextureId,
+					})
+				end
+			end
+		end
+	end
 
-    -- Capture full HumanoidDescription (body colors, face, body parts)
-    local success, desc = pcall(function()
-        return humanoid:GetAppliedDescription()
-    end)
-    if success and desc then
-        snapshot.description = {
-            -- Body colors
-            HeadColor         = desc.HeadColor.R .. "," .. desc.HeadColor.G .. "," .. desc.HeadColor.B,
-            LeftArmColor      = desc.LeftArmColor.R .. "," .. desc.LeftArmColor.G .. "," .. desc.LeftArmColor.B,
-            RightArmColor     = desc.RightArmColor.R .. "," .. desc.RightArmColor.G .. "," .. desc.RightArmColor.B,
-            LeftLegColor      = desc.LeftLegColor.R .. "," .. desc.LeftLegColor.G .. "," .. desc.LeftLegColor.B,
-            RightLegColor     = desc.RightLegColor.R .. "," .. desc.RightLegColor.G .. "," .. desc.RightLegColor.B,
-            TorsoColor        = desc.TorsoColor.R .. "," .. desc.TorsoColor.G .. "," .. desc.TorsoColor.B,
-            -- Face & body assets
-            Face              = desc.Face,
-            Head              = desc.Head,
-            Torso             = desc.Torso,
-            LeftArm           = desc.LeftArm,
-            RightArm          = desc.RightArm,
-            LeftLeg           = desc.LeftLeg,
-            RightLeg          = desc.RightLeg,
-            -- Scale
-            HeightScale       = desc.HeightScale,
-            WidthScale        = desc.WidthScale,
-            HeadScale         = desc.HeadScale,
-            DepthScale        = desc.DepthScale,
-            ProportionScale   = desc.ProportionScale,
-            BodyTypeScale     = desc.BodyTypeScale,
-        }
-    end
+	local ok, desc = pcall(function() return humanoid:GetAppliedDescription() end)
+	if ok and desc then
+		local function rgb(c) return c.R..","..c.G..","..c.B end
+		snapshot.description = {
+			HeadColor       = rgb(desc.HeadColor),
+			LeftArmColor    = rgb(desc.LeftArmColor),
+			RightArmColor   = rgb(desc.RightArmColor),
+			LeftLegColor    = rgb(desc.LeftLegColor),
+			RightLegColor   = rgb(desc.RightLegColor),
+			TorsoColor      = rgb(desc.TorsoColor),
+			Face            = desc.Face,
+			Head            = desc.Head,
+			Torso           = desc.Torso,
+			LeftArm         = desc.LeftArm,
+			RightArm        = desc.RightArm,
+			LeftLeg         = desc.LeftLeg,
+			RightLeg        = desc.RightLeg,
+			HeightScale     = desc.HeightScale,
+			WidthScale      = desc.WidthScale,
+			HeadScale       = desc.HeadScale,
+			DepthScale      = desc.DepthScale,
+			ProportionScale = desc.ProportionScale,
+			BodyTypeScale   = desc.BodyTypeScale,
+		}
+	end
 
-    return snapshot
+	return snapshot
 end
 
 -- ============================================================
---  HELPER: Apply a saved snapshot to a character
+--  OUTFIT APPLY
 -- ============================================================
 
 local function applyOutfit(character, snapshot)
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return false end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return false end
 
-    -- Apply shirt
-    if snapshot.shirt then
-        local existing = character:FindFirstChildOfClass("Shirt")
-        if existing then existing:Destroy() end
-        local shirt = Instance.new("Shirt")
-        shirt.ShirtTemplate = snapshot.shirt
-        shirt.Parent = character
-    end
+	if snapshot.shirt then
+		local ex = character:FindFirstChildOfClass("Shirt")
+		if ex then ex:Destroy() end
+		local s = Instance.new("Shirt"); s.ShirtTemplate = snapshot.shirt; s.Parent = character
+	end
 
-    -- Apply pants
-    if snapshot.pants then
-        local existing = character:FindFirstChildOfClass("Pants")
-        if existing then existing:Destroy() end
-        local pants = Instance.new("Pants")
-        pants.PantsTemplate = snapshot.pants
-        pants.Parent = character
-    end
+	if snapshot.pants then
+		local ex = character:FindFirstChildOfClass("Pants")
+		if ex then ex:Destroy() end
+		local p = Instance.new("Pants"); p.PantsTemplate = snapshot.pants; p.Parent = character
+	end
 
-    -- Apply HumanoidDescription (body, face, scale)
-    if snapshot.description then
-        local d = snapshot.description
+	if snapshot.description then
+		local d = snapshot.description
+		local function parseColor(str)
+			if not str then return Color3.new(1,1,1) end
+			local r,g,b = str:match("([^,]+),([^,]+),([^,]+)")
+			return Color3.new(tonumber(r), tonumber(g), tonumber(b))
+		end
+		local ok, desc = pcall(function() return humanoid:GetAppliedDescription() end)
+		if ok and desc then
+			desc.HeadColor       = parseColor(d.HeadColor)
+			desc.LeftArmColor    = parseColor(d.LeftArmColor)
+			desc.RightArmColor   = parseColor(d.RightArmColor)
+			desc.LeftLegColor    = parseColor(d.LeftLegColor)
+			desc.RightLegColor   = parseColor(d.RightLegColor)
+			desc.TorsoColor      = parseColor(d.TorsoColor)
+			if d.Face   and d.Face   > 0 then desc.Face   = d.Face   end
+			if d.Head   and d.Head   > 0 then desc.Head   = d.Head   end
+			if d.Torso  and d.Torso  > 0 then desc.Torso  = d.Torso  end
+			if d.LeftArm  and d.LeftArm  > 0 then desc.LeftArm  = d.LeftArm  end
+			if d.RightArm and d.RightArm > 0 then desc.RightArm = d.RightArm end
+			if d.LeftLeg  and d.LeftLeg  > 0 then desc.LeftLeg  = d.LeftLeg  end
+			if d.RightLeg and d.RightLeg > 0 then desc.RightLeg = d.RightLeg end
+			if d.HeightScale     then desc.HeightScale     = d.HeightScale     end
+			if d.WidthScale      then desc.WidthScale      = d.WidthScale      end
+			if d.HeadScale       then desc.HeadScale       = d.HeadScale       end
+			if d.DepthScale      then desc.DepthScale      = d.DepthScale      end
+			if d.ProportionScale then desc.ProportionScale = d.ProportionScale end
+			if d.BodyTypeScale   then desc.BodyTypeScale   = d.BodyTypeScale   end
+			pcall(function() humanoid:ApplyDescription(desc) end)
+		end
+	end
 
-        local function parseColor(str)
-            if not str then return Color3.new(1,1,1) end
-            local r, g, b = str:match("([^,]+),([^,]+),([^,]+)")
-            return Color3.new(tonumber(r), tonumber(g), tonumber(b))
-        end
-
-        local success, desc = pcall(function()
-            return humanoid:GetAppliedDescription()
-        end)
-
-        if success and desc then
-            desc.HeadColor       = parseColor(d.HeadColor)
-            desc.LeftArmColor    = parseColor(d.LeftArmColor)
-            desc.RightArmColor   = parseColor(d.RightArmColor)
-            desc.LeftLegColor    = parseColor(d.LeftLegColor)
-            desc.RightLegColor   = parseColor(d.RightLegColor)
-            desc.TorsoColor      = parseColor(d.TorsoColor)
-
-            if d.Face           and d.Face > 0           then desc.Face = d.Face end
-            if d.Head           and d.Head > 0           then desc.Head = d.Head end
-            if d.Torso          and d.Torso > 0          then desc.Torso = d.Torso end
-            if d.LeftArm        and d.LeftArm > 0        then desc.LeftArm = d.LeftArm end
-            if d.RightArm       and d.RightArm > 0       then desc.RightArm = d.RightArm end
-            if d.LeftLeg        and d.LeftLeg > 0        then desc.LeftLeg = d.LeftLeg end
-            if d.RightLeg       and d.RightLeg > 0       then desc.RightLeg = d.RightLeg end
-
-            if d.HeightScale     then desc.HeightScale = d.HeightScale end
-            if d.WidthScale      then desc.WidthScale = d.WidthScale end
-            if d.HeadScale       then desc.HeadScale = d.HeadScale end
-            if d.DepthScale      then desc.DepthScale = d.DepthScale end
-            if d.ProportionScale then desc.ProportionScale = d.ProportionScale end
-            if d.BodyTypeScale   then desc.BodyTypeScale = d.BodyTypeScale end
-
-            pcall(function() humanoid:ApplyDescription(desc) end)
-        end
-    end
-
-    return true
+	return true
 end
 
 -- ============================================================
 --  REMOTE: Save Outfit
---  Client sends: slotName (string), optional custom name
 -- ============================================================
 
 SaveOutfitEvent.OnServerEvent:Connect(function(player, slotName, customName)
-    if typeof(slotName) ~= "string" or #slotName == 0 then return end
-    slotName = slotName:sub(1, 30)  -- Limit length
+	if typeof(slotName) ~= "string" or #slotName == 0 then return end
+	slotName = slotName:sub(1,30)
 
-    local character = player.Character
-    if not character then
-        SaveResultEvent:FireClient(player, false, "No character found")
-        return
-    end
+	local character = player.Character
+	if not character then
+		SaveResultEvent:FireClient(player, false, "No character found"); return
+	end
 
-    local snapshot = captureOutfit(character)
-    if not snapshot then
-        SaveResultEvent:FireClient(player, false, "Could not read outfit")
-        return
-    end
+	local snapshot = captureOutfit(character)
+	if not snapshot then
+		SaveResultEvent:FireClient(player, false, "Could not read outfit"); return
+	end
 
-    -- Load current data, add/update slot, save back
-    local data = loadPlayerData(player.UserId)
+	local data = loadData(player.UserId)
+	local count = 0
+	for _ in pairs(data) do count += 1 end
 
-    -- Count slots
-    local slotCount = 0
-    for _ in pairs(data) do slotCount += 1 end
+	if not data[slotName] and count >= MAX_SLOTS then
+		SaveResultEvent:FireClient(player, false, "Max slots reached ("..MAX_SLOTS..")"); return
+	end
 
-    -- Check if this is a new slot and we're at the limit
-    if not data[slotName] and slotCount >= MAX_SLOTS then
-        SaveResultEvent:FireClient(player, false, "Max outfit slots reached (" .. MAX_SLOTS .. ")")
-        return
-    end
-
-    data[slotName] = {
-        snapshot    = snapshot,
-        displayName = customName or slotName,
-        savedAt     = os.time(),
-    }
-
-    local ok = savePlayerData(player.UserId, data)
-    if ok then
-        SaveResultEvent:FireClient(player, true, slotName)
-        print("[OutfitSystem] Saved outfit '" .. slotName .. "' for " .. player.Name)
-    else
-        SaveResultEvent:FireClient(player, false, "DataStore error — try again")
-    end
+	data[slotName] = { snapshot = snapshot, displayName = customName or slotName, savedAt = os.time() }
+	local ok = saveData(player.UserId, data)
+	SaveResultEvent:FireClient(player, ok, ok and slotName or "DataStore error")
 end)
 
 -- ============================================================
 --  REMOTE: Load Outfit
---  Client sends: slotName
---  Returns: success (bool), message (string)
 -- ============================================================
 
 LoadOutfitFunc.OnServerInvoke = function(player, slotName)
-    if typeof(slotName) ~= "string" then return false, "Invalid slot name" end
-
-    local data = loadPlayerData(player.UserId)
-    local slot = data[slotName]
-
-    if not slot then
-        return false, "Outfit slot '" .. slotName .. "' not found"
-    end
-
-    local character = player.Character
-    if not character then
-        return false, "No character"
-    end
-
-    local ok = applyOutfit(character, slot.snapshot)
-    if ok then
-        print("[OutfitSystem] Loaded outfit '" .. slotName .. "' for " .. player.Name)
-        return true, "Outfit applied!"
-    else
-        return false, "Failed to apply outfit"
-    end
+	if typeof(slotName) ~= "string" then return false, "Invalid" end
+	local data = loadData(player.UserId)
+	local slot = data[slotName]
+	if not slot then return false, "Slot not found" end
+	local character = player.Character
+	if not character then return false, "No character" end
+	local ok = applyOutfit(character, slot.snapshot)
+	return ok, ok and "Applied!" or "Failed"
 end
 
 -- ============================================================
 --  REMOTE: Get All Outfits
---  Returns: table of { slotName, displayName, savedAt } for this player
 -- ============================================================
 
 GetOutfitsFunc.OnServerInvoke = function(player)
-    local data = loadPlayerData(player.UserId)
-    local result = {}
-    for slotName, slotData in pairs(data) do
-        table.insert(result, {
-            slotName    = slotName,
-            displayName = slotData.displayName or slotName,
-            savedAt     = slotData.savedAt or 0,
-        })
-    end
-    -- Sort by saved time
-    table.sort(result, function(a, b) return a.savedAt < b.savedAt end)
-    return result
+	local data = loadData(player.UserId)
+	local result = {}
+	for slotName, slotData in pairs(data) do
+		table.insert(result, {
+			slotName    = slotName,
+			displayName = slotData.displayName or slotName,
+			savedAt     = slotData.savedAt or 0,
+		})
+	end
+	table.sort(result, function(a,b) return a.savedAt < b.savedAt end)
+	return result
 end
 
 -- ============================================================
@@ -350,23 +240,215 @@ end
 -- ============================================================
 
 DeleteOutfitEvent.OnServerEvent:Connect(function(player, slotName)
-    if typeof(slotName) ~= "string" then return end
-
-    local data = loadPlayerData(player.UserId)
-    if data[slotName] then
-        data[slotName] = nil
-        savePlayerData(player.UserId, data)
-        print("[OutfitSystem] Deleted outfit '" .. slotName .. "' for " .. player.Name)
-    end
+	if typeof(slotName) ~= "string" then return end
+	local data = loadData(player.UserId)
+	if data[slotName] then
+		data[slotName] = nil
+		saveData(player.UserId, data)
+	end
 end)
 
 -- ============================================================
---  Auto-save on player leave (extra safety)
+--  REMOTE: Search Catalog  ← NEW
+--
+--  Calls the Roblox catalog API via HttpService (server only).
+--  query    = search string from player
+--  typeFilter = "Shirt" | "Pants" | "Hat" | nil (all)
+--
+--  Returns: array of { Name, AssetId, Type }
 -- ============================================================
 
+-- Map from our internal type names to Roblox API subcategory numbers
+local SUBCATEGORY_MAP = {
+	Shirt  = 12,   -- Shirts
+	Pants  = 13,   -- Pants
+	Hat    = 41,   -- Hair & Accessories (broad)
+	Face   = 19,   -- Faces
+	Outfit = 55,   -- Bundles / Outfits
+}
+
+-- ============================================================
+--  REMOTE: Search Catalog via AvatarEditorService
+--  This is the Roblox-approved way to search the catalog
+--  from inside a game — no HttpService needed
+-- ============================================================
+
+local AvatarEditorService = game:GetService("AvatarEditorService")
+
+-- Map our type names to Roblox AvatarAssetType enums
+local ASSET_TYPE_MAP = {
+	Shirt  = Enum.AvatarAssetType.Shirt,
+	Pants  = Enum.AvatarAssetType.Pants,
+	Hat    = Enum.AvatarAssetType.Hat,
+	Face   = Enum.AvatarAssetType.Face,
+}
+
+-- Map Roblox AvatarAssetType back to our type names
+local ASSET_TYPE_NAMES = {
+	[Enum.AvatarAssetType.Shirt] = "Shirt",
+	[Enum.AvatarAssetType.Pants] = "Pants",
+	[Enum.AvatarAssetType.Hat]   = "Hat",
+	[Enum.AvatarAssetType.Face]  = "Face",
+	[Enum.AvatarAssetType.TShirt] = "Shirt",
+	[Enum.AvatarAssetType.ShoulderAccessory] = "Hat",
+	[Enum.AvatarAssetType.WaistAccessory]    = "Hat",
+	[Enum.AvatarAssetType.NeckAccessory]     = "Hat",
+	[Enum.AvatarAssetType.FaceAccessory]     = "Hat",
+	[Enum.AvatarAssetType.FrontAccessory]    = "Hat",
+	[Enum.AvatarAssetType.BackAccessory]     = "Hat",
+	[Enum.AvatarAssetType.HairAccessory]     = "Hat",
+}
+
+SearchCatalogFunc.OnServerInvoke = function(player, query, typeFilter)
+	if typeof(query) ~= "string" or #query < 2 then return {} end
+	query = query:sub(1, 60)
+
+	local searchParams = CatalogSearchParams.new()
+	searchParams.SearchKeyword = query
+
+	-- Apply asset type filter if provided, otherwise just search all clothing
+	if typeFilter and ASSET_TYPE_MAP[typeFilter] then
+		searchParams.AssetTypes = { ASSET_TYPE_MAP[typeFilter] }
+	end
+	-- No AssetTypes set = searches everything, which is fine
+
+	local ok, pages = pcall(function()
+		return AvatarEditorService:SearchCatalog(searchParams)
+	end)
+
+	if not ok then
+		warn("AvatarEditorService search error: " .. tostring(pages))
+		return {}
+	end
+
+	local results = {}
+
+	local pageOk, items = pcall(function()
+		return pages:GetCurrentPage()
+	end)
+
+	if not pageOk or not items then return {} end
+
+	for _, item in ipairs(items) do
+		if item.Id and item.Name then
+			local typeName = "Hat"
+			if item.AssetType then
+				typeName = ASSET_TYPE_NAMES[item.AssetType] or "Hat"
+			end
+			table.insert(results, {
+				Name    = item.Name,
+				AssetId = item.Id,
+				Type    = typeName,
+			})
+		end
+	end
+
+	print("Search returned", #results, "results for:", query)
+	return results
+end
+
+-- Client requests character model to be built into their viewport WorldModel
+GetCharacterModelFunc.OnServerInvoke = function(player)
+	-- Find the player's WorldModel in their PlayerGui
+	local playerGui = player:FindFirstChild("PlayerGui")
+	if not playerGui then return false end
+
+	local phoneGui = playerGui:FindFirstChild("PhoneGui")
+	if not phoneGui then return false end
+
+	local avatarScreen = phoneGui:FindFirstChild("AvatarScreen")
+	if not avatarScreen then return false end
+
+	local charPreview = avatarScreen:FindFirstChild("CharacterPreview")
+	if not charPreview then return false end
+
+	local worldModel = charPreview:FindFirstChild("WorldModel")
+	if not worldModel then return false end
+
+	-- Clear any existing models
+	for _, child in ipairs(worldModel:GetChildren()) do
+		if child:IsA("Model") then child:Destroy() end
+	end
+
+	-- Build the character model server-side
+	local ok, desc = pcall(function()
+		return Players:GetCharacterAppearanceAsync(player.UserId)
+	end)
+	if not ok or not desc then return false end
+
+	local modelOk, model = pcall(function()
+		return Players:CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R15)
+	end)
+	if not modelOk or not model then return false end
+
+	-- Anchor all parts and place at origin
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Anchored = true
+			part.CanCollide = false
+		end
+	end
+
+	local root = model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("UpperTorso")
+	if root then
+		root.CFrame = CFrame.new(0, 0, 0)
+	end
+
+	-- Place directly into the WorldModel
+	model.Parent = worldModel
+	print("✅ Server placed character model for", player.Name)
+	return true
+end
+
+-- ============================================================
+--  BALANCE SYSTEM
+-- ============================================================
+
+local BalanceStore  = DataStoreService:GetDataStore("PlayerBalance_v1")
+local playerBalances = {} -- in-memory cache
+
+local function getBalanceKey(userId) return "balance_" .. tostring(userId) end
+
+local function loadBalance(userId)
+	local ok, data = pcall(function()
+		return BalanceStore:GetAsync(getBalanceKey(userId))
+	end)
+	return (ok and data) or 0
+end
+
+local function saveBalance(userId, amount)
+	pcall(function()
+		BalanceStore:SetAsync(getBalanceKey(userId), amount)
+	end)
+end
+
+-- Load balance when player joins
+Players.PlayerAdded:Connect(function(player)
+	local balance = loadBalance(player.UserId)
+	playerBalances[player.UserId] = balance
+end)
+
+-- Clean up when player leaves
 Players.PlayerRemoving:Connect(function(player)
-    -- Data is saved immediately on each save action, this is just a log
-    print("[OutfitSystem] " .. player.Name .. " left the game.")
+	if playerBalances[player.UserId] then
+		saveBalance(player.UserId, playerBalances[player.UserId])
+		playerBalances[player.UserId] = nil
+	end
 end)
 
-print("✅ Outfit Save System loaded!")
+-- Client requests their balance
+GetBalanceFunc.OnServerInvoke = function(player)
+	return playerBalances[player.UserId] or 0
+end
+
+-- Helper function other scripts can use to add money to a player
+-- e.g. require this script and call addMoney(player, 100)
+local function addMoney(player, amount)
+	if not playerBalances[player.UserId] then return end
+	playerBalances[player.UserId] = playerBalances[player.UserId] + amount
+	saveBalance(player.UserId, playerBalances[player.UserId])
+	UpdateBalanceEvent:FireClient(player, playerBalances[player.UserId])
+end
+
+print("✅ Outfit Save + Catalog Search + Bank Server loaded!")
